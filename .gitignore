@@ -1,0 +1,14 @@
+# videos and model weights are large and are not stored in git
+data/*
+!data/README.md
+checkpoints/*
+!checkpoints/README.md
+results/*
+!results/.gitkeep
+
+# python / notebooks
+__pycache__/
+*.egg-info/
+.ipynb_checkpoints/
+.vscode/
+*.pyc
