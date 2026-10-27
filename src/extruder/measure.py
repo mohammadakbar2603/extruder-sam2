@@ -29,7 +29,7 @@ import numpy as np
 from scipy.ndimage import binary_fill_holes as ndi_fill, gaussian_filter1d
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
-from skimage.morphology import skeletonize
+from skimage.graph import MCP_Geometric, route_through_array
 
 from .calib import DIE_HOLE_DIAMETER_MM
 
@@ -59,121 +59,88 @@ def rectify(mask, crop_origin, px_to_mm, grid_per_mm=GRID_PER_MM):
     return out > 0, grid_per_mm
 
 
-def _longest_path(skel):
-    """Pixels of the longest path through a skeleton (list of (y, x)) and its length in cells."""
-    ys, xs = np.nonzero(skel)
-    n = len(ys)
-    if n < 2:
-        return np.stack([ys, xs], 1), 0.0
-    idx = -np.ones(skel.shape, int)
-    idx[ys, xs] = np.arange(n)
-    rows, cols, w = [], [], []
-    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        y2, x2 = ys + dy, xs + dx
-        ok = (y2 >= 0) & (y2 < skel.shape[0]) & (x2 >= 0) & (x2 < skel.shape[1])
-        j = np.full(n, -1)
-        j[ok] = idx[y2[ok], x2[ok]]
-        ok = j >= 0
-        rows += list(np.arange(n)[ok]); cols += list(j[ok]); w += [np.hypot(dy, dx)] * int(ok.sum())
-    g = coo_matrix((w + w, (rows + cols, cols + rows)), shape=(n, n)).tocsr()
-    d0 = dijkstra(g, indices=0)
-    a = int(np.nanargmax(np.where(np.isinf(d0), -1, d0)))
-    da, pred = dijkstra(g, indices=a, return_predecessors=True)
-    b = int(np.nanargmax(np.where(np.isinf(da), -1, da)))
-    path = [b]
-    while path[-1] != a and pred[path[-1]] >= 0:
-        path.append(int(pred[path[-1]]))
-    return np.stack([ys[path], xs[path]], 1), float(da[b])
-
-
-FULL_CIRCLE = 0.95   # a circle counts as "full size" if its radius is >= 95 % of the typical radius
-DIR_FROM, DIR_TO = 0.0, 1.0   # end direction measured between these distances (in radii) from the end
+FULL_CIRCLE = 0.85   # a circle is "full size" at >= 85 % of the typical radius
+TIP_ZONE = 2.0       # look for the last full-size circle only within this many radii of each tip
 SNAP = 10            # grid cells (0.5 mm): read each circle size from the distance ridge this close to the line
+RIDGE_POWER = 8.0    # how strongly the middle line is pulled onto the ridge of biggest circles
 
 
-def centerline(m, cells_per_unit, full=None):
-    """The piece's middle line through the centres of the biggest circles that fit inside.
+def _farthest_inside(cost, start):
+    """Point inside the piece that is farthest from `start` when walking only inside it."""
+    d, _ = MCP_Geometric(cost).find_costs([tuple(start)])
+    d[~np.isfinite(d)] = -1
+    return np.unravel_index(int(np.argmax(d)), d.shape)
 
-    1. distance map: every pixel inside gets its distance to the nearest edge. On the middle
-       line, this is the radius of the biggest circle centred there that fits in the piece;
-    2. skeleton: the (slightly smoothed) shape thinned to a 1-pixel middle line; keep its
-       longest path = the chain of circle centres from one end to the other;
-    3. smooth that chain (a path made of pixel steps is longer than the real line);
-    4. near each end the circles shrink (rounded tip) or the chain forks into the corners
-       (flat, knife-cut face). We keep the chain only between the first and the last
-       *full-size* circle (radius >= 95 % of the typical radius);
-    5. from the last full-size circle at each end, go straight on (about one radius, in the
-       direction of the chain) until the edge of the piece: that is the tip.
-       LENGTH = chain of centres + the two short end pieces.
-    Returns a dict (lengths in grid cells): dt, path (kept chain of centres), r (radius along
-    it), centres (where each of those circles sits), tips, ext (the two end pieces), length,
-    r_med, full_path (raw skeleton path).
+
+def centerline(m, cells_per_unit, step=2):
+    """Middle line that follows the piece like a thread laid along it, from tip to tip.
+
+    1. distance map: every inside point gets its distance to the nearest edge (on the middle
+       line = radius of the biggest circle that fits there);
+    2. the two TIPS: start anywhere inside, walk (only inside the piece) to the farthest point:
+       that is one tip; from there, the farthest point again is the other tip;
+    3. the path between the two tips that stays on the ridge of biggest circles (walking is
+       cheap where the circles are big, expensive near the edge), so it follows bends and curls
+       like a thread would;
+    4. smooth it (a path made of pixel steps is longer than the real line);
+    5. the two ends: near each tip, the last full-size circle (>= 85 % of the typical radius)
+       touches the tip (rounded end) or the cut face (flat end), so the end is counted as one
+       radius beyond it. Without this, a path ending in a corner of a flat cut face would be
+       about 40 % of a radius too long at that end.
+       LENGTH = path between those two circles + one radius at each end.
+    The search runs on a 2x coarser grid (10 cells per mm) for speed; distances use the full grid.
+    Returns a dict (lengths in grid cells): dt, path (smoothed tip-to-tip path), r (radius of the
+    biggest circle along it), centres (where each circle sits), tips, length, r_med, full_path.
     """
-    full = FULL_CIRCLE if full is None else full
     k = cells_per_unit
     dt = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    # skeleton of a slightly smoothed, hole-free outline: ragged edges would add side branches
-    sm = cv2.GaussianBlur(ndi_fill(m).astype(np.float32), (0, 0), max(1.0, 0.4 * k)) > 0.5
-    sk = skeletonize(sm)
-    n_sk, lab_sk = cv2.connectedComponents(sk.astype(np.uint8), connectivity=8)
-    if n_sk > 2:  # keep the biggest skeleton piece
-        sizes = np.bincount(lab_sk.ravel())[1:]
-        sk = lab_sk == 1 + int(np.argmax(sizes))
-    path, _ = _longest_path(sk)
-    if len(path) < 5:
+    ms = cv2.resize(m.astype(np.uint8), (m.shape[1] // step, m.shape[0] // step), interpolation=cv2.INTER_AREA) > 0
+    ms = ndi_fill(ms)
+    dts = cv2.distanceTransform(ms.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    if dts.max() <= 0:
         rr = float(dt.max())
-        return dict(dt=dt, path=path.astype(float), r=np.array([rr]), tips=[], ext=(rr, rr), length=2 * rr,
-                    r_med=rr, full_path=path)
-    # circle size at each centre: the distance-map ridge right next to the line (the smoothed
-    # outline can shift the thin line slightly off the true centre on bends)
-    centres = path.copy()
+        return dict(dt=dt, path=np.zeros((0, 2)), r=np.array([rr]), centres=np.zeros((0, 2), int), tips=[],
+                    length=2 * rr, r_med=rr, full_path=np.zeros((0, 2), int))
+    walk = np.where(ms, 1.0, np.inf)
+    seed = np.unravel_index(int(np.argmax(dts)), dts.shape)
+    a = _farthest_inside(walk, seed)
+    b = _farthest_inside(walk, a)
+    ridge_cost = np.where(ms, 1.0 / (dts / dts.max() + 0.02) ** RIDGE_POWER, np.inf)
+    coarse, _ = route_through_array(ridge_cost, a, b, fully_connected=True, geometric=True)
+    path = np.clip(np.array(coarse) * step + step // 2, 0, np.array(m.shape) - 1)
+    full_path = path.copy()
+    sm_path = gaussian_filter1d(path.astype(float), max(2.0, 0.5 * k), axis=0, mode="nearest")
+    # circle size at each point: the distance-map ridge right next to the path
+    centres = np.clip(np.round(sm_path).astype(int), 0, np.array(m.shape) - 1)
     if SNAP:
         disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * SNAP + 1,) * 2) > 0
         H, W = dt.shape
-        for i, (y, x) in enumerate(path):
+        for i, (y, x) in enumerate(centres.copy()):
             y0, x0 = max(0, y - SNAP), max(0, x - SNAP)
             win = dt[y0:y + SNAP + 1, x0:x + SNAP + 1] * disk[SNAP - (y - y0):SNAP + (min(H, y + SNAP + 1) - y),
                                                                SNAP - (x - x0):SNAP + (min(W, x + SNAP + 1) - x)]
             dy, dx = np.unravel_index(int(np.argmax(win)), win.shape)
             centres[i] = (y0 + dy, x0 + dx)
-    r_all = dt[centres[:, 0], centres[:, 1]]
-    r_raw = dt[path[:, 0], path[:, 1]]   # used to decide where the full-size circles stop
-    n = len(r_all)
-    central = slice(int(0.2 * n), max(int(0.8 * n), int(0.2 * n) + 1))
-    r_med = float(np.median(r_all[central]))
-    big = np.nonzero(r_raw >= full * float(np.median(r_raw[central])))[0]
-    i0, i1 = (int(big[0]), int(big[-1])) if len(big) >= 2 else (0, n - 1)
-    sm_path = gaussian_filter1d(path.astype(float), max(2.0, 0.5 * k), axis=0, mode="nearest")
-    mid = sm_path[i0:i1 + 1]
-    r = r_all[i0:i1 + 1]
-    chain = float(np.sum(np.hypot(*np.diff(mid, axis=0).T)))
-    # from the last full-size circle, go straight on (about one radius) until the edge of the piece
-    a2 = np.concatenate([[0], np.cumsum(np.hypot(*np.diff(mid, axis=0).T))])
-    tips, ext = [], []
-    for end in (0, -1):
-        p = mid[end]
-        from_end = a2 if end == 0 else a2[-1] - a2
-        # direction of the chain a little way in from the end (the very end can lean into a corner)
-        j_near = int(np.argmin(np.abs(from_end - DIR_FROM * r_med)))
-        j_far = int(np.argmin(np.abs(from_end - DIR_TO * r_med)))
-        v = mid[j_near] - mid[j_far]
-        nv = np.linalg.norm(v)
-        t = 0.0
-        if nv > 1e-6:
-            v = v / nv
-            for _ in range(4 * sum(m.shape)):
-                q = p + v * (t + 0.25)
-                yi, xi = int(round(q[0])), int(round(q[1]))
-                if not (0 <= yi < m.shape[0] and 0 <= xi < m.shape[1]) or not m[yi, xi]:
-                    break
-                t += 0.25
-        else:
-            t, v = float(r[end]), np.zeros(2)
-        tips.append(p + v * t)
-        ext.append(t)
-    ext = tuple(ext)
-    return dict(dt=dt, path=mid, r=r, centres=centres[i0:i1 + 1], tips=tips, ext=ext,
-                length=chain + ext[0] + ext[1], r_med=r_med, full_path=path)
+    r = dt[centres[:, 0], centres[:, 1]]
+    n = len(r)
+    r_med = float(np.median(r[int(0.2 * n):max(int(0.8 * n), int(0.2 * n) + 1)]))
+    # the tips: at a flat (knife-cut) face the path ends in a corner of the face, which is
+    # about 40 % of a radius too far. Within the last few radii of each end, find the last
+    # full-size circle; the tip or the cut face is one radius beyond it. The search is limited
+    # to the ends, so a curl further in cannot stop it early.
+    seg = np.hypot(*np.diff(sm_path, axis=0).T)
+    arc = np.concatenate([[0], np.cumsum(seg)])
+    yi, xi = np.clip(np.round(sm_path).astype(int), 0, np.array(m.shape) - 1).T
+    r_on = dt[yi, xi]
+    i0, i1, e0, e1 = 0, n - 1, 0.0, 0.0
+    head = np.nonzero((arc <= TIP_ZONE * r_med) & (r_on >= FULL_CIRCLE * r_med))[0]
+    tail = np.nonzero((arc >= arc[-1] - TIP_ZONE * r_med) & (r_on >= FULL_CIRCLE * r_med))[0]
+    if len(head) and len(tail) and head[0] < tail[-1]:
+        i0, i1 = int(head[0]), int(tail[-1])
+        e0, e1 = float(r_on[i0]), float(r_on[i1])
+    length = float(arc[i1] - arc[i0]) + e0 + e1
+    return dict(dt=dt, path=sm_path, r=r, centres=centres, tips=[sm_path[0], sm_path[-1]],
+                length=length, r_med=r_med, full_path=full_path, ends=(i0, i1), end_radius=(e0, e1))
 
 
 def measure_grid_mask(m, cells_per_unit, unit="mm", die_hole=DIE_HOLE_DIAMETER_MM):
@@ -208,6 +175,38 @@ def measure_grid_mask(m, cells_per_unit, unit="mm", die_hole=DIE_HOLE_DIAMETER_M
     if unit == "mm":
         out["expansion"] = float((width / die_hole) ** 2)
     return out
+
+
+def outline_roughness(m, cells_per_mm, smooth_mm=0.5):
+    """How ragged the outline is, in % of the piece's area.
+
+    The mask is compared with a smoothed copy of itself (outline blurred over ~0.5 mm, holes
+    filled). A clean, smooth mask hardly changes (about 1-2 %); a speckled, torn or holey mask
+    (motion blur, steam, two pieces touching) changes a lot.
+    """
+    m = np.pad(m.astype(bool), int(3 * smooth_mm * cells_per_mm) + 3)
+    sm = cv2.GaussianBlur(ndi_fill(m).astype(np.float32), (0, 0), smooth_mm * cells_per_mm) > 0.5
+    return float(np.logical_xor(m, sm).sum() / max(1, sm.sum()) * 100)
+
+
+# ---- dropping bad masks (thresholds set by eye on clip 0069; to be confirmed on hand-labelled masks)
+MAX_ROUGHNESS_PCT = 2.5       # ragged outline: speckles, holes, torn edges
+TUBE_FILL_RANGE = (0.80, 1.20)  # area / (length x diameter); single tubes measure 0.88-1.03, merges 1.22+
+MAX_STABILITY_PCT = 5.0       # measurement changes too much when the piece is turned
+
+
+def mask_problem(res):
+    """Why a measured mask should be left out of the clip average ("" = fine)."""
+    if res.get("roughness_pct", 0) > MAX_ROUGHNESS_PCT:
+        return "ragged_outline"
+    fill = res.get("tube_fill")
+    if fill is not None and fill > TUBE_FILL_RANGE[1]:
+        return "extra_area_merged_piece"
+    if fill is not None and fill < TUBE_FILL_RANGE[0]:
+        return "missing_area_cut_off_piece"
+    if res.get("shape_stability_pct", 0) > MAX_STABILITY_PCT:
+        return "unstable_measurement"
+    return ""
 
 
 ROTATIONS = (0, 45, 90, 135)   # degrees
@@ -253,6 +252,10 @@ def measure_mask(mask, crop_origin=(0, 0), px_to_mm=None):
         g, k = rectify(mask, crop_origin, px_to_mm)
         if g is not None:
             res.update(measure_rotations(g, k, unit="mm"))
+            res["roughness_pct"] = outline_roughness(g, k)
+            if res.get("length_mm") and res.get("width_mm"):
+                res["tube_fill"] = res["area_mm2"] / (res["length_mm"] * res["width_mm"])
+            res["mask_problem"] = mask_problem(res)
     else:
         res["straightness"] = px.get("straightness", np.nan)
     return res
