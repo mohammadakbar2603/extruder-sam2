@@ -223,7 +223,10 @@ def measurement_hists(table, cols, path=None):
     fig, ax = plt.subplots(1, len(cols), figsize=(4.2 * len(cols), 3.4), squeeze=False)
     for a, c in zip(ax[0], cols):
         for key, col in (("red", "tab:red"), ("blue", "tab:blue")):
-            v = keep[f"{key}_{c}"].dropna()
+            used = keep
+            if f"{key}_mask_problem" in keep:   # leave out masks dropped by the shape checks
+                used = keep[keep[f"{key}_mask_problem"].fillna("").eq("")]
+            v = used[f"{key}_{c}"].dropna()
             if len(v):
                 a.hist(v, bins=25, alpha=0.5, color=col, label=f"{key}: {v.mean():.2f} ± {v.std():.2f}")
         a.set(title=c, ylabel="pieces"); a.legend(fontsize=8)

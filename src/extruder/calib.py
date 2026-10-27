@@ -127,3 +127,19 @@ def apply(matrix, xy):
     """Apply a 2x3 mapping to points (..., 2)."""
     xy = np.asarray(xy, float)
     return xy @ matrix[:, :2].T + matrix[:, 2]
+
+
+def choose_reference(points_px):
+    """Which points set the mm scale for this video, from what was clicked.
+
+    1. both bolts visible -> the bolts (65 mm apart; true plate points);
+    2. otherwise holes A and B (55 mm apart). Both are found from their rope ends, which stick
+       out toward the camera by the same amount, so the shift cancels in their distance;
+    3. otherwise None (pixels only; the scale must then come from the lab data).
+    """
+    have = {k for k, v in points_px.items() if v is not None}
+    if {"bolt_near", "bolt_far"} <= have:
+        return ("bolt_near", "bolt_far"), "bolts"
+    if {"hole_A", "hole_B"} <= have:
+        return ("hole_A", "hole_B"), "holes A+B"
+    return None, "none"

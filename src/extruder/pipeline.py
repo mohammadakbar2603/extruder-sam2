@@ -35,7 +35,7 @@ def load_clicks(path):
 
 
 def refine_points(video, info, clicked, log=print):
-    """Hole A is snapped to its exact centre (from the rope ends); bolts and hole B are used as clicked."""
+    """Holes A and B are snapped to their exact centres (from their rope ends); bolts are used as clicked."""
     refined = {}
     xy = lambda p: f"({float(p[0]):.1f}, {float(p[1]):.1f})"
     a = clicked.get("hole_A") or DEFAULT_HOLE_A
@@ -52,8 +52,14 @@ def refine_points(video, info, clicked, log=print):
             refined[name] = tuple(clicked[name])
             log(f"{name}: using the click {xy(clicked[name])}")
     if clicked.get("hole_B") is not None:
-        refined["hole_B"] = tuple(clicked["hole_B"])
-        log(f"hole_B: using the click {xy(clicked['hole_B'])}")
+        rb = cutsmod.refine_hole(video, clicked["hole_B"], info["fps"])
+        if rb["spread_px"] is not None:
+            refined["hole_B"] = rb["hole_xy"]
+            log(f"hole B: click {xy(clicked['hole_B'])} -> centre {xy(rb['hole_xy'])} "
+                f"(median of {rb['n_rope_ends_used']} rope ends, typical spread {rb['spread_px']:.1f} px)")
+        else:
+            refined["hole_B"] = tuple(clicked["hole_B"])
+            log(f"hole B: could not refine; using the click {xy(clicked['hole_B'])}")
     return refined, r
 
 
@@ -137,8 +143,8 @@ def check_cut(res, prep, min_area=200, ratio=(0.5, 2.0), edge=2):
 
 
 # -------------------------------------------------------------- step 4: save + measure
-def save_and_measure(row, res, prep, out_dir, px_to_mm=None):
-    """Save the red and blue masks (with frame numbers in the names) and measure both."""
+def save_and_measure(row, res, prep, out_dir, px_to_mm=None, measure=True):
+    """Save the red and blue masks (with frame numbers in the names) and, if asked, measure both."""
     from .viz import overlay, RED, BLUE
     out_dir = Path(out_dir)
     (out_dir / "masks").mkdir(parents=True, exist_ok=True)
@@ -155,8 +161,10 @@ def save_and_measure(row, res, prep, out_dir, px_to_mm=None):
         Image.fromarray(overlay(img, m, col)[max(0, hy - 120):hy + 120, max(0, hx - 120):hx + 120]).save(
             out_dir / "overlays" / f"{name}.jpg", quality=90)
         row[f"{key}_mask_file"] = str(out_dir / "masks" / f"{name}.png")
-        for k, v in measure_mask(m, prep["origin"], px_to_mm).items():
-            row[f"{key}_{k}"] = v
+        row[f"{key}_area_px"] = int(m.sum())
+        if measure:
+            for k, v in measure_mask(m, prep["origin"], px_to_mm).items():
+                row[f"{key}_{k}"] = v
     return row
 
 
@@ -184,19 +192,24 @@ def summarise(table, video_name, extra=None):
     s = dict(video=video_name, cuts_detected=int(len(table)), cuts_kept=int(len(keep)))
     s.update({f"rejected_{r}": int(n) for r, n in table.loc[~table["keep"], "reason"].value_counts().items()})
     for key in ("red", "blue"):
+        used = keep
+        if f"{key}_mask_problem" in keep:   # leave out masks dropped by the shape checks
+            used = keep[keep[f"{key}_mask_problem"].fillna("").eq("")]
+            s[f"{key}_masks_used"] = int(len(used))
         for m in MEASURES:
             c = f"{key}_{m}"
-            if c in keep and keep[c].notna().any():
-                s[f"{c}_mean"] = float(keep[c].mean())
-                s[f"{c}_sd"] = float(keep[c].std())
+            if c in used and used[c].notna().any():
+                s[f"{c}_mean"] = float(used[c].mean())
+                s[f"{c}_sd"] = float(used[c].std())
     if extra:
         s.update(extra)
     return s
 
 
 # -------------------------------------------------------------- everything for all cuts of one video
-def run_cuts(predictor, prep, out_dir, px_to_mm=None, device="cuda", n_track=16, max_cuts=None, progress=True):
-    """Track every cut of the video, save both masks per cut, measure them. Returns the cut table."""
+def run_cuts(predictor, prep, out_dir, px_to_mm=None, device="cuda", n_track=16, max_cuts=None, progress=True,
+             measure=True):
+    """Track every cut of the video, save both masks per cut, measure them (optional). Returns the cut table."""
     from tqdm.auto import tqdm
     events = prep["cuts"]["events"]
     idx = range(len(events)) if max_cuts is None else range(min(max_cuts, len(events)))
@@ -204,7 +217,7 @@ def run_cuts(predictor, prep, out_dir, px_to_mm=None, device="cuda", n_track=16,
     for k in tqdm(idx, desc="cuts", disable=not progress):
         row, res = process_cut(predictor, prep, k, events[k], device=device, n_track=n_track)
         if res is not None:
-            row = save_and_measure(row, res, prep, out_dir, px_to_mm)
+            row = save_and_measure(row, res, prep, out_dir, px_to_mm, measure=measure)
         rows.append(row)
     table = flag_outliers(pd.DataFrame(rows))
     table.to_csv(Path(out_dir) / "cuts.csv", index=False)
@@ -218,8 +231,8 @@ def save_summary(table, out_dir, video_name, extra=None):
     return s
 
 
-def run_video(video, results_dir, predictor, crop_size=360, calibration_points=("bolt_near", "bolt_far"),
-              device="cuda", n_track=16, max_cuts=None, log=print):
+def run_video(video, results_dir, predictor, crop_size=360, calibration_points=None,
+              device="cuda", n_track=None, max_cuts=None, log=print):
     """The whole pipeline for one video, using its saved clicks (results/<name>/clicks.json)."""
     video = Path(video)
     out_dir = Path(results_dir) / video.stem
@@ -229,13 +242,46 @@ def run_video(video, results_dir, predictor, crop_size=360, calibration_points=(
         return None
     info = probe(video)
     refined, _ = refine_points(video, info, clicks["clicked"], log=log)
-    mapping = None
-    try:
-        mapping = calib.fit_mapping({**clicks["clicked"], **refined}, use=calibration_points)
-    except ValueError as e:
-        log(f"No mm conversion for {video.name}: {e}")
+    points = {**clicks["clicked"], **refined}
+    use = calibration_points or calib.choose_reference(points)[0]
+    mapping = calib.fit_mapping(points, use=use) if use else None
+    if mapping is None:
+        log(f"No mm conversion for {video.name}: click both bolts, or holes A and B.")
     prep = prepare_crops(video, out_dir, refined["hole_A"], crop_size, log=log)
+    n_track = n_track or adaptive_n_track(prep["cuts"]["period_frames"])
     table = run_cuts(predictor, prep, out_dir, mapping["px_to_mm"] if mapping else None, device, n_track, max_cuts)
     extra = dict(cut_hz=prep["cuts"]["cut_hz"], px_per_mm=mapping["px_per_mm"] if mapping else None,
                  hole_A_px=list(refined["hole_A"]), crop_origin=list(prep["origin"]))
     return save_summary(table, out_dir, video.name, extra)
+
+
+# -------------------------------------------------------------- Experiment 1: many videos, cached
+TRACKING_VERSION = "tracking-v1"   # change this to force every video to be tracked again
+
+
+def adaptive_n_track(period_frames, factor=1.6, minimum=8):
+    """Frames SAM 2 follows each piece: about 1.6 knife cycles (17 at 450 rpm, 10 at 750, 8 at 1005)."""
+    return int(max(minimum, round(factor * period_frames)))
+
+
+def track_video_cached(predictor, video, out_dir, hole_xy, crop_size=360, n_track=None, max_cuts=None,
+                       device="cuda", force=False, log=print):
+    """Crop + find cuts + SAM 2 tracking for one video, re-using earlier results when nothing changed.
+
+    The settings of a finished run are stored in tracking.json; if they match (same video, crop
+    position, window, number of cuts, code version) the saved cuts.csv and masks are re-used.
+    Returns (cut table, prep).
+    """
+    out_dir = Path(out_dir)
+    prep = prepare_crops(video, out_dir, hole_xy, crop_size, log=log)
+    n = n_track or adaptive_n_track(prep["cuts"]["period_frames"])
+    cfg = dict(version=TRACKING_VERSION, video=Path(video).name, origin=list(prep["origin"]), crop_size=crop_size,
+               n_track=n, max_cuts=max_cuts)
+    cfg_path, table_path = out_dir / "tracking.json", out_dir / "cuts.csv"
+    if not force and cfg_path.exists() and table_path.exists() and json.loads(cfg_path.read_text()) == cfg:
+        log(f"Re-using saved tracking ({table_path})")
+        return pd.read_csv(table_path), prep
+    log(f"Tracking with a window of {n} frames ({prep['cuts']['period_frames']:.1f} frames per cut)")
+    table = run_cuts(predictor, prep, out_dir, None, device, n, max_cuts, measure=False)
+    cfg_path.write_text(json.dumps(cfg))
+    return table, prep
