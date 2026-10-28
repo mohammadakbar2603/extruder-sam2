@@ -64,7 +64,7 @@ def refine_points(video, info, clicked, log=print):
 
 
 # -------------------------------------------------------------- step 2: crop + cuts
-def prepare_crops(video, out_dir, hole_xy, crop_size=360, log=print):
+def prepare_crops(video, out_dir, hole_xy, crop_size=360, log=print, brightness=1.0):
     """Cut the crop around hole A out of every frame, save as JPEGs, and measure the blink signal."""
     info = probe(video)
     out_dir = Path(out_dir)
@@ -74,6 +74,8 @@ def prepare_crops(video, out_dir, hole_xy, crop_size=360, log=print):
     hole_in_crop = (hole_xy[0] - origin[0], hole_xy[1] - origin[1])
     meta_path = fdir / "meta.json"
     meta = dict(video=Path(video).name, origin=origin, crop_size=crop_size)
+    if brightness and abs(brightness - 1.0) > 1e-6:
+        meta["brightness"] = round(float(brightness), 3)
     files = sorted(fdir.glob("*.jpg"))
     if meta_path.exists() and json.loads(meta_path.read_text()) == meta and len(files) >= info["n_frames"] - 2:
         log(f"Re-using {len(files)} crop frames already in {fdir}")
@@ -86,7 +88,8 @@ def prepare_crops(video, out_dir, hole_xy, crop_size=360, log=print):
         yy, xx = np.mgrid[0:crop_size, 0:crop_size]
         disc = (xx - round(hole_in_crop[0])) ** 2 + (yy - round(hole_in_crop[1])) ** 2 <= 10 ** 2
         sig = []
-        for i, fr in enumerate(iter_crops(video, origin[0], origin[1], crop_size, info["width"], info["height"])):
+        for i, fr in enumerate(iter_crops(video, origin[0], origin[1], crop_size, info["width"], info["height"],
+                                                brightness=brightness)):
             Image.fromarray(fr).save(fdir / f"{i:05d}.jpg", quality=95)
             sub = fr[disc].astype(np.float32)
             sig.append(float((sub[:, 0] - sub[:, 2]).mean()))
@@ -265,7 +268,7 @@ def adaptive_n_track(period_frames, factor=1.6, minimum=8):
 
 
 def track_video_cached(predictor, video, out_dir, hole_xy, crop_size=360, n_track=None, max_cuts=None,
-                       device="cuda", force=False, log=print):
+                       device="cuda", force=False, log=print, brightness=1.0):
     """Crop + find cuts + SAM 2 tracking for one video, re-using earlier results when nothing changed.
 
     The settings of a finished run are stored in tracking.json; if they match (same video, crop
@@ -273,10 +276,10 @@ def track_video_cached(predictor, video, out_dir, hole_xy, crop_size=360, n_trac
     Returns (cut table, prep).
     """
     out_dir = Path(out_dir)
-    prep = prepare_crops(video, out_dir, hole_xy, crop_size, log=log)
+    prep = prepare_crops(video, out_dir, hole_xy, crop_size, log=log, brightness=brightness)
     n = n_track or adaptive_n_track(prep["cuts"]["period_frames"])
     cfg = dict(version=TRACKING_VERSION, video=Path(video).name, origin=list(prep["origin"]), crop_size=crop_size,
-               n_track=n, max_cuts=max_cuts)
+               n_track=n, max_cuts=max_cuts, brightness=round(float(brightness or 1.0), 3))
     cfg_path, table_path = out_dir / "tracking.json", out_dir / "cuts.csv"
     if not force and cfg_path.exists() and table_path.exists() and json.loads(cfg_path.read_text()) == cfg:
         log(f"Re-using saved tracking ({table_path})")

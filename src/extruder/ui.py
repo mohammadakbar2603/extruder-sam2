@@ -25,12 +25,13 @@ from PIL import Image
 from IPython.display import display
 
 from .calib import POINT_LABELS, POINT_NAMES
-from .video import read_frame
+from .video import apply_brightness, auto_brightness, read_frame
 from .viz import POINT_COLOURS
 
 
 class ReferenceClicker:
-    def __init__(self, video, info, clean_image, save_path, points=None, view_centre=(722, 488), view_half=260):
+    def __init__(self, video, info, clean_image, save_path, points=None, view_centre=(722, 488), view_half=260,
+                 brightness=1.0):
         self.video, self.info, self.clean = str(video), info, clean_image
         self.save_path = Path(save_path)
         self.points = {k: (tuple(v) if v is not None else None) for k, v in (points or {}).items()}
@@ -41,10 +42,14 @@ class ReferenceClicker:
         self.w_view = W.ToggleButtons(options=["Clean die (median)", "Single frame"], description="View:")
         self.w_frame = W.IntSlider(0, 0, info["n_frames"] - 1, description="Frame:", continuous_update=False,
                                    layout=W.Layout(width="600px"))
-        self.w_gain = W.FloatSlider(1.0, min=1.0, max=3.0, step=0.1, description="Brightness:", continuous_update=False)
+        self.w_gain = W.FloatSlider(1.0, min=1.0, max=3.0, step=0.05, description="Brightness:",
+                                    continuous_update=False, tooltip="saved with the points; SAM 2 sees the video this bright")
         self.w_clear = W.Button(description="Remove this point", icon="trash")
         self.w_save = W.Button(description="Save points", button_style="success", icon="save")
+        self.w_auto = W.Button(description="Auto brightness", icon="sun")
         self.w_msg = W.Output()
+        self.w_gain.value = float(brightness or 1.0)
+        self.w_auto.on_click(self._on_auto)
 
         plt.ioff()
         self.fig, self.ax = plt.subplots(figsize=(10, 6.2))
@@ -66,8 +71,21 @@ class ReferenceClicker:
     # -------------------------------------------------------------- display
     def show(self):
         display(W.VBox([W.HBox([self.w_point, self.w_clear, self.w_save]),
-                        W.HBox([self.w_view, self.w_gain]), self.w_frame, self.fig.canvas, self.w_msg]))
+                        W.HBox([self.w_view, self.w_gain, self.w_auto]), self.w_frame, self.fig.canvas, self.w_msg]))
+        self._refresh_image()
         self._say("Pick a point in the list, then left-click it in the picture.")
+
+    @property
+    def brightness(self):
+        return float(self.w_gain.value)
+
+    def _on_auto(self, _):
+        hole = self.points.get("hole_A")
+        if hole is None:
+            self._say("Click hole A first: auto brightness looks at the area around it.")
+            return
+        self.w_gain.value = auto_brightness(self.clean, hole)
+        self._say(f"Brightness set to {self.w_gain.value:.2f}. Press Save points to keep it.")
 
     def _say(self, text):
         with self.w_msg:
@@ -78,9 +96,7 @@ class ReferenceClicker:
 
     def _refresh_image(self):
         img = self.clean if self.w_view.value.startswith("Clean") else self._read(self.w_frame.value)
-        g = self.w_gain.value
-        if g != 1.0:
-            img = np.clip(img.astype(np.float32) * g, 0, 255).astype(np.uint8)
+        img = apply_brightness(img, self.w_gain.value)
         self.im.set_data(img)
         self.fig.canvas.draw_idle()
 
@@ -119,7 +135,8 @@ class ReferenceClicker:
 
     def _on_save(self, _):
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"video": Path(self.video).name, "clicked": {k: v for k, v in self.points.items() if v is not None}}
+        data = {"video": Path(self.video).name, "clicked": {k: v for k, v in self.points.items() if v is not None},
+                "brightness": self.brightness}
         old = json.loads(self.save_path.read_text()) if self.save_path.exists() else {}
         old.update(data)
         self.save_path.write_text(json.dumps(old, indent=1))
@@ -149,11 +166,13 @@ class MultiVideoClicker:
                                   layout=W.Layout(width="420px"))
         self.w_view = W.ToggleButtons(options=["Clean die (median)", "Single frame"], description="View:")
         self.w_frame = W.IntSlider(0, 0, 1, description="Frame:", continuous_update=False, layout=W.Layout(width="600px"))
-        self.w_gain = W.FloatSlider(1.0, min=1.0, max=3.0, step=0.1, description="Brightness:", continuous_update=False)
+        self.w_gain = W.FloatSlider(1.0, min=1.0, max=3.0, step=0.05, description="Brightness:",
+                                    continuous_update=False, tooltip="saved with the points; SAM 2 sees the video this bright")
         self.w_copy = W.Button(description="Copy points from previous video", icon="copy", layout=W.Layout(width="260px"))
         self.w_clear = W.Button(description="Remove this point", icon="trash")
         self.w_save = W.Button(description="Save", button_style="success", icon="save")
         self.w_next = W.Button(description="Save & next", button_style="info", icon="arrow-right")
+        self.w_auto = W.Button(description="Auto brightness", icon="sun")
         self.w_msg = W.Output()
         plt.ioff()
         self.fig, self.ax = plt.subplots(figsize=(10, 6.2))
@@ -171,6 +190,7 @@ class MultiVideoClicker:
         self.w_clear.on_click(self._on_clear)
         self.w_save.on_click(lambda _: self._save())
         self.w_next.on_click(self._on_next)
+        self.w_auto.on_click(self._on_auto)
         self._update_video_list(select=next((v for v in self.videos if not self.has_clicks(v)), self.videos[0]))
 
     # ---------------------------------------------------------- saved state
@@ -180,6 +200,10 @@ class MultiVideoClicker:
     def saved_points(self, video):
         p = self.clicks_path(video)
         return json.loads(p.read_text()).get("clicked", {}) if p.exists() else {}
+
+    def saved_brightness(self, video):
+        p = self.clicks_path(video)
+        return float(json.loads(p.read_text()).get("brightness", 1.0)) if p.exists() else 1.0
 
     def has_clicks(self, video):
         pts = self.saved_points(video)
@@ -192,14 +216,14 @@ class MultiVideoClicker:
         for v in self.videos:
             pts = self.saved_points(v)
             rows.append(dict(video=v.name, **{n: ("yes" if pts.get(n) is not None else "") for n in POINT_NAMES},
-                             ready="yes" if self.has_clicks(v) else "NO"))
+                             brightness=self.saved_brightness(v), ready="yes" if self.has_clicks(v) else "NO"))
         return pd.DataFrame(rows)
 
     # ---------------------------------------------------------- display
     def show(self):
         display(W.VBox([W.HBox([self.w_video, self.w_copy]),
                         W.HBox([self.w_point, self.w_clear, self.w_save, self.w_next]),
-                        W.HBox([self.w_view, self.w_gain]), self.w_frame, self.fig.canvas, self.w_msg]))
+                        W.HBox([self.w_view, self.w_gain, self.w_auto]), self.w_frame, self.fig.canvas, self.w_msg]))
         self._say("Pick a point type, then left-click it in the picture.")
 
     def _update_video_list(self, select=None):
@@ -219,6 +243,8 @@ class MultiVideoClicker:
         self.clean = np.asarray(Image.open(clean_path).convert("RGB")) if clean_path.exists() else \
             read_frame(str(v), 0, self.info["fps"], self.info["width"], self.info["height"])
         self.points = {k: tuple(p) for k, p in self.saved_points(v).items() if p is not None}
+        if self.clicks_path(v).exists():
+            self.w_gain.value = self.saved_brightness(v)   # a new video keeps the current setting
         self._refresh_image()
         cx, cy = self.points.get("hole_A") or (self.info["width"] / 2, self.info["height"] / 2)
         h = self.view_half
@@ -236,9 +262,7 @@ class MultiVideoClicker:
 
     def _refresh_image(self):
         img = self.clean if self.w_view.value.startswith("Clean") else self._frame(self.w_frame.value)
-        g = self.w_gain.value
-        if g != 1.0:
-            img = np.clip(img.astype(np.float32) * g, 0, 255).astype(np.uint8)
+        img = apply_brightness(img, self.w_gain.value)
         self.im.set_data(img)
         self.im.set_extent((0, img.shape[1], img.shape[0], 0))
         self.fig.canvas.draw_idle()
@@ -258,7 +282,8 @@ class MultiVideoClicker:
         with self.w_msg:
             self.w_msg.clear_output()
             print(text)
-            print("Points:", {k: (round(v[0], 1), round(v[1], 1)) for k, v in self.points.items()})
+            print("Points:", {k: (round(v[0], 1), round(v[1], 1)) for k, v in self.points.items()},
+                  f"| brightness {self.w_gain.value:.2f}")
             done = sum(self.has_clicks(v) for v in self.videos)
             print(f"Videos with saved points: {done} of {len(self.videos)}")
 
@@ -279,6 +304,14 @@ class MultiVideoClicker:
         self._draw_points()
         self._say(f"Removed {self.w_point.value}.")
 
+    def _on_auto(self, _):
+        hole = self.points.get("hole_A")
+        if hole is None:
+            self._say("Click hole A first: auto brightness looks at the area around it.")
+            return
+        self.w_gain.value = auto_brightness(self.clean, hole)
+        self._say(f"Brightness set to {self.w_gain.value:.2f}. Press Save to keep it.")
+
     def _on_copy(self, _):
         i = self.videos.index(self._video())
         prev = next((v for v in reversed(self.videos[:i]) if self.saved_points(v)), None)
@@ -286,6 +319,7 @@ class MultiVideoClicker:
             self._say("No earlier video has saved points.")
             return
         self.points = {k: tuple(p) for k, p in self.saved_points(prev).items()}
+        self.w_gain.value = self.saved_brightness(prev)
         self._draw_points()
         self._say(f"Copied the points of {prev.name}. Check them (zoom in), move any that are off, then Save.")
 
@@ -300,7 +334,8 @@ class MultiVideoClicker:
         old = json.loads(p.read_text()) if p.exists() else {}
         if old.get("clicked") != {k: list(map(float, xy)) for k, xy in self.points.items()}:
             old.pop("refined", None)        # clicks changed: refined positions must be recomputed
-        old.update(video=v.name, clicked={k: list(map(float, xy)) for k, xy in self.points.items()})
+        old.update(video=v.name, clicked={k: list(map(float, xy)) for k, xy in self.points.items()},
+                   brightness=float(self.w_gain.value))
         p.write_text(json.dumps(old, indent=1))
         self._update_video_list(select=v)
         self._say(f"Saved {p}.")

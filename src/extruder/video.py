@@ -68,11 +68,38 @@ def read_frame(path, index, fps, width=None, height=None):
     return np.frombuffer(raw, np.uint8).reshape(height, width, 3).copy()
 
 
-def iter_crops(path, x0, y0, size, width=None, height=None):
+BRIGHTNESS_TARGET = 0.22   # "auto" brightness: median grey level around hole A (0-1) of the brighter videos
+
+
+def apply_brightness(img, brightness=1.0):
+    """Brighten an RGB uint8 image: out = in ^ (1 / brightness), on a 0-1 scale (a "gamma" curve).
+
+    1.0 = unchanged; 1.5 or 2.0 = brighter. Dark parts are lifted much more than bright ones,
+    so bright metal does not burn out. The video processing uses exactly the same curve.
+    """
+    if brightness is None or abs(brightness - 1.0) < 1e-6:
+        return img
+    lut = (255.0 * (np.arange(256) / 255.0) ** (1.0 / brightness) + 0.5).astype(np.uint8)
+    return lut[np.asarray(img)]
+
+
+def auto_brightness(clean_image, hole_xy, half=180, target=BRIGHTNESS_TARGET, max_value=3.0):
+    """Brightness that makes the area around hole A as bright as `target` (never darkens)."""
+    g = np.asarray(clean_image).astype(np.float32).mean(-1) / 255.0
+    x, y = int(round(hole_xy[0])), int(round(hole_xy[1]))
+    m = float(np.median(g[max(0, y - half):y + half, max(0, x - half):x + half]))
+    if m <= 0 or m >= target:
+        return 1.0
+    return float(np.clip(round(np.log(m) / np.log(target) / 0.05) * 0.05, 1.0, max_value))
+
+
+def iter_crops(path, x0, y0, size, width=None, height=None, brightness=1.0):
     """Yield every frame of a square crop (size x size) whose top-left corner is (x0, y0).
 
     Streams the video, so memory use stays small even for long clips. If the crop
-    reaches outside the frame it is padded with black.
+    reaches outside the frame it is padded with black. `brightness` > 1 lifts dark parts
+    (see apply_brightness); it is applied at 16 bits per colour, before rounding to 8 bits,
+    so the camera's 10-bit shadow detail is kept.
     """
     if width is None or height is None:
         info = probe(path)
@@ -83,6 +110,11 @@ def iter_crops(path, x0, y0, size, width=None, height=None):
     # convert to RGB *before* cropping: the camera stores colour at half resolution, and cropping
     # that directly makes ffmpeg silently move odd x/y positions by 1 px
     vf = f"format=rgb24,crop={cx1 - cx0}:{cy1 - cy0}:{cx0}:{cy0}"
+    if brightness is not None and abs(brightness - 1.0) > 1e-6:
+        e = 1.0 / brightness
+        curve = f"maxval*pow(val/maxval\\,{e:.6f})"
+        vf = (f"format=rgb48le,lutrgb=r={curve}:g={curve}:b={curve},format=rgb24,"
+              f"crop={cx1 - cx0}:{cy1 - cy0}:{cx0}:{cy0}")
     if (cx0, cy0, cx1, cy1) != (x0, y0, x0 + size, y0 + size):
         vf += f",pad={size}:{size}:{cx0 - x0}:{cy0 - y0}:black"
     cmd = [_tool("ffmpeg"), "-v", "error", "-i", str(path), "-vf", vf, "-fps_mode", "passthrough",
@@ -100,9 +132,9 @@ def iter_crops(path, x0, y0, size, width=None, height=None):
         proc.wait()
 
 
-def read_crops(path, x0, y0, size):
+def read_crops(path, x0, y0, size, brightness=1.0):
     """All frames of a square crop as one array (n, size, size, 3). Use for small crops only."""
-    return np.stack(list(iter_crops(path, x0, y0, size)))
+    return np.stack(list(iter_crops(path, x0, y0, size, brightness=brightness)))
 
 
 def clean_die_image(path, n_samples=70):
