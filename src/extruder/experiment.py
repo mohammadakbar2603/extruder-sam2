@@ -116,6 +116,49 @@ def collect_pieces(per_video, clip_of):
     return p
 
 
+# ------------------------------------------------------------------ choosing pieces by length
+# A piece pointing toward the camera looks shorter than it is; nothing makes it look longer.
+# So, within one clip, the longest good mask is the best view of the true length, and masks
+# close to it are pieces lying flat to the camera.
+def add_length_ratio(pieces):
+    """length_ratio = length / longest used mask of the same clip and mask type (RED or BLUE).
+
+    Only masks that pass the bad-mask checks can be "the longest", so a merged or leaked mask
+    cannot set the bar. length_ratio_p95 uses the 95th-percentile length instead of the longest.
+    """
+    p = pieces.copy()
+    u = p[p["used"]].groupby(["clip", "key"])["length_mm"]
+    idx = pd.MultiIndex.from_frame(p[["clip", "key"]])
+    for name, ref in (("length_ratio", u.max()), ("length_ratio_p95", u.quantile(0.95))):
+        p[name] = p["length_mm"].to_numpy() / ref.reindex(idx).to_numpy()
+    return p
+
+
+def length_selections(thresholds=(0.5, 0.6, 0.7, 0.8, 0.9, 1.0), references=("longest", "p95")):
+    """The ways of choosing pieces, in order: every mask, every good mask, then by length.
+
+    Each one is dict(checks=bool, ratio=column or None, min_ratio=number or None).
+    "≥0.7 longest" = good masks at least 70 % as long as the longest of their clip.
+    "longest only" = the single longest good mask of each clip.
+    """
+    sel = {"every mask": dict(checks=False, ratio=None, min_ratio=None),
+           "good masks": dict(checks=True, ratio=None, min_ratio=None)}
+    for ref in references:
+        col = "length_ratio" if ref == "longest" else "length_ratio_p95"
+        for t in thresholds:
+            name = "longest only" if (ref == "longest" and t >= 1) else f"≥{t:.1f} {ref}"
+            sel[name] = dict(checks=True, ratio=col, min_ratio=float(t))
+    return sel
+
+
+def select_pieces(pieces, spec):
+    """True for the pieces chosen by one selection of length_selections()."""
+    keep = pieces["used"] if spec["checks"] else pd.Series(True, index=pieces.index)
+    if spec["ratio"] is not None:
+        keep = keep & (pieces[spec["ratio"]] >= spec["min_ratio"] - 1e-9)
+    return keep & pieces["length_mm"].notna()
+
+
 # ------------------------------------------------------------------ clip averages
 def clip_table(pieces, labels):
     """Per clip and mask type: pieces used, mean / SD / median of diameter and length (mm and px)."""
@@ -165,10 +208,10 @@ def _bootstrap_ci(err, n=2000, seed=0):
     return float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5))
 
 
-def metrics(comp):
-    """Error measures per variant, mask type and target, over all clips."""
+def metrics(comp, by=("variant", "key", "target")):
+    """Error measures per variant, mask type and target (or any other grouping `by`), over all clips."""
     rows = []
-    for (variant, key, t), g in comp.groupby(["variant", "key", "target"], sort=False):
+    for names, g in comp.groupby(list(by), sort=False):
         g = g.dropna(subset=["video", "lab"])
         if not len(g):
             continue
@@ -177,7 +220,7 @@ def metrics(comp):
         lo, hi = _bootstrap_ci(ae)
         ss_res, ss_tot = (e ** 2).sum(), ((g["lab"] - g["lab"].mean()) ** 2).sum()
         r = float(np.corrcoef(g["video"], g["lab"])[0, 1]) if len(g) > 2 else np.nan
-        rows.append(dict(variant=variant, key=key, target=t, clips=len(g), MAE=ae.mean(), MAE_CI_low=lo,
+        rows.append(dict(zip(by, names), clips=len(g), MAE=ae.mean(), MAE_CI_low=lo,
                          MAE_CI_high=hi, RMSE=np.sqrt((e ** 2).mean()), MAPE=float((ae / g["lab"].abs()).mean() * 100),
                          bias=e.mean(), limits_of_agreement=1.96 * e.std(ddof=1) if len(e) > 1 else np.nan,
                          R2=float(1 - ss_res / ss_tot) if ss_tot > 0 else np.nan, correlation=r,
@@ -233,7 +276,7 @@ def plot_errors(met, path=None):
     return fig
 
 
-def plot_agreement(comp, key, variant=MAIN_VARIANT, path=None):
+def plot_agreement(comp, key, variant=MAIN_VARIANT, path=None, title=None):
     """Video vs lab (left) and Bland-Altman (right), one point per clip, coloured by setting."""
     fig, ax = plt.subplots(2, 2, figsize=(14, 11))
     for row, t in enumerate(TARGETS):
@@ -257,7 +300,7 @@ def plot_agreement(comp, key, variant=MAIN_VARIANT, path=None):
         a.set(xlabel=f"average of video and lab {t} (mm)", ylabel="video − lab (mm)",
               title=f"Bland–Altman: bias {bias:+.2f} mm, 95 % limits {bias - 1.96 * sd:+.2f} to {bias + 1.96 * sd:+.2f}")
         a.grid(alpha=0.3)
-    fig.suptitle(f"Zero training — {key.upper()} masks — {variant}", fontsize=13)
+    fig.suptitle(title or f"Zero training — {key.upper()} masks — {variant}", fontsize=13)
     plt.tight_layout()
     if path is not None:
         fig.savefig(path, dpi=90, bbox_inches="tight")

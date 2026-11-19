@@ -31,6 +31,7 @@ The only manual step is **clicking hole A, hole B and the visible bolt(s) once p
 |---|---|
 | `01_cut_frame_pipeline.ipynb` | one video, every step explained with figures |
 | `02_experiment1_geometric.ipynb` | **Experiment 1 (zero training):** all videos, clicks once, tracking, measuring, dropping, clip averages compared with the lab for every clip, all metrics and figures |
+| `03_experiment_dl0.ipynb` | **DL-0, end to end:** same steps as 02 (re-uses its saved work; the click tool opens only for videos without points), then which pieces to average (every mask, good masks, masks at least 50–100 % as long as the clip's longest) and *k* × geometric value with leave-one-setting-out / leave-one-clip-out. Results in `results/dl0/` |
 
 | Step | What you see in the notebook |
 |---|---|

@@ -73,7 +73,8 @@ def prepare_crops(video, out_dir, hole_xy, crop_size=360, log=print, brightness=
     origin = (int(round(hole_xy[0])) - half, int(round(hole_xy[1])) - half)
     hole_in_crop = (hole_xy[0] - origin[0], hole_xy[1] - origin[1])
     meta_path = fdir / "meta.json"
-    meta = dict(video=Path(video).name, origin=origin, crop_size=crop_size)
+    # origin as a list: meta.json reads back as a list, and a tuple never equals a list
+    meta = dict(video=Path(video).name, origin=list(origin), crop_size=crop_size)
     if brightness and abs(brightness - 1.0) > 1e-6:
         meta["brightness"] = round(float(brightness), 3)
     files = sorted(fdir.glob("*.jpg"))
@@ -273,6 +274,7 @@ def track_video_cached(predictor, video, out_dir, hole_xy, crop_size=360, n_trac
 
     The settings of a finished run are stored in tracking.json; if they match (same video, crop
     position, window, number of cuts, code version) the saved cuts.csv and masks are re-used.
+    `predictor` may also be a function that loads SAM 2; it is then called only if tracking is needed.
     Returns (cut table, prep).
     """
     out_dir = Path(out_dir)
@@ -284,6 +286,8 @@ def track_video_cached(predictor, video, out_dir, hole_xy, crop_size=360, n_trac
     if not force and cfg_path.exists() and table_path.exists() and json.loads(cfg_path.read_text()) == cfg:
         log(f"Re-using saved tracking ({table_path})")
         return pd.read_csv(table_path), prep
+    if not hasattr(predictor, "init_state"):   # a loader function, not the model itself
+        predictor = predictor()
     log(f"Tracking with a window of {n} frames ({prep['cuts']['period_frames']:.1f} frames per cut)")
     table = run_cuts(predictor, prep, out_dir, None, device, n, max_cuts, measure=False)
     cfg_path.write_text(json.dumps(cfg))
